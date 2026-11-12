@@ -1,10 +1,10 @@
-# ==============================
 # Eclipse Workspace
-# ==============================
 .metadata/
 
-# ==============================
-# Java Build Files
-# ==============================
+# Java Build
 bin/
 *.class
+
+# OS
+.DS_Store
+Thumbs.db
