@@ -1,0 +1,336 @@
+==========================================================================
+ 공유 낙서장 (SharedDrawingBoard) - 아키텍처 및 개발 가이드
+ (AI 코딩 도우미와 팀원이 작업 전에 반드시 읽는 문서)
+==========================================================================
+
+[이 문서를 읽는 AI에게]
+- 이 프로젝트에서 코드를 작성하거나 수정하기 전에 이 문서 전체를 먼저 읽어라.
+- 아래 "6. 반드시 지켜야 할 규칙"을 어기는 변경은 하지 마라.
+  규칙과 다르게 해야 할 이유가 생기면 먼저 사용자에게 설명하고 확인을 받아라.
+- 실제 코드가 이 문서와 다르면 코드가 최신이다. 차이를 사용자에게 알리고,
+  작업이 끝나면 이 문서의 해당 부분을 함께 고쳐라.
+- 기능을 추가/변경했다면 마지막에 "9. 진행 현황" 표를 갱신하라.
+- 구현하지 않은 기능을 구현했다고 보고하지 마라.
+
+--------------------------------------------------------------------------
+1. 프로젝트 개요
+--------------------------------------------------------------------------
+- 과목: 네트워크 프로그래밍 / 팀 A4 (전다연, 최승호)
+- 주제: TCP 소켓으로 여러 사용자가 하나의 무한 캔버스(낙서장)를 실시간 공유
+- 캔버스에 올라가는 것: 펜 그림, 텍스트, 이미지, 표, 캘린더
+- 핵심 아이디어
+  (1) 모든 콘텐츠는 독립 객체다. 표 위에 그린 펜 그림은 별도 객체이므로
+      표를 옮겨도 그림은 제자리에 남는다.
+  (2) 통합 지우개: 펜 그림은 해당 부분만 지운다. 표/캘린더 같은 서식 객체에
+      지우개를 쓰면 이미지로 자동 변환해 픽셀 단위로 지우고,
+      변환 전 원본 데이터는 복구용으로 보관한다.
+  (3) 실시간 동기화: 펜 좌표는 버퍼에 모아 일정 간격으로 전송하고,
+      객체 생성/이동/수정/삭제는 이벤트 메시지로 전송한다.
+      서버는 처리 순서를 정해 다른 클라이언트에 전달한다.
+- 기능 우선순위 (MoSCoW)
+  Must  : TCP 연결, 실시간 동기화, 무한 캔버스, 펜, 텍스트, 독립 객체 관리
+  Should: 이미지, 표, 캘린더, 통합 지우개, 자동 이미지 변환
+  Could : 중요 영역 보관함 (캔버스 일부 영역을 선택해 별도 보관)
+  Won't : 로그인, 서버 영구 저장 (이번 범위 제외 - 구현하지 말 것)
+
+--------------------------------------------------------------------------
+2. 개발 환경
+--------------------------------------------------------------------------
+- Java 21 (JDK 21), Eclipse 일반 Java Project (Maven/Gradle 아님)
+- GUI: Java Swing
+- 소스 인코딩: UTF-8 (.settings 에 프로젝트 단위로 지정되어 있음)
+- 외부 라이브러리: 현재 없음. Java 표준 라이브러리만 사용한다.
+  꼭 필요하면 사용자 확인 후 JAR 를 직접 추가한다.
+  단, TCP 통신과 동기화 로직은 반드시 직접 구현한다 (과제 요구사항).
+- 실행: Eclipse 에서 src/client/Main.java 우클릭 > Run As > Java Application
+- module-info.java 는 사용하지 않는다 (만들지 말 것).
+- bin/ 은 빌드 결과물이라 Git 에서 제외되어 있다 (.gitignore).
+
+--------------------------------------------------------------------------
+3. 현재 패키지 구조 (구현 완료된 것만)
+--------------------------------------------------------------------------
+src
+├── common                         모든 기능이 따르는 공통 규칙(인터페이스)
+│   ├── CanvasObject.java          캔버스 객체 공통 인터페이스
+│   ├── Tool.java                  도구 공통 인터페이스
+│   ├── Command.java               실행취소 가능한 작업 인터페이스
+│   └── Feature.java               기능 등록 단위 인터페이스
+└── client
+    ├── Main.java                  시작점. 관리자 생성 + 기능 등록 + 창 표시
+    ├── ui
+    │   ├── MainFrame.java         기본 창(1200x800), 상단 도구바, 중앙 캔버스
+    │   └── CanvasPanel.java       객체 그리기 + 마우스 입력을 현재 Tool 에 전달
+    ├── core                       공통 관리자 (기능별 코드가 들어가면 안 됨)
+    │   ├── ObjectManager.java     객체 목록 관리
+    │   ├── ToolManager.java       현재 도구 관리
+    │   ├── HistoryManager.java    Undo/Redo 관리
+    │   ├── FeatureRegistry.java   기능 목록 관리
+    │   └── AddObjectCommand.java  "객체 추가" 공통 명령
+    └── feature
+        └── test                   아키텍처 검증용 테스트 기능
+            ├── TestObject.java    파란 사각형 (ID 앞 8자리 표시)
+            ├── TestTool.java      클릭 위치에 TestObject 생성
+            └── TestFeature.java   "테스트 사각형" 기능
+
+--------------------------------------------------------------------------
+4. 각 구성 요소의 계약 (반드시 이 동작을 유지할 것)
+--------------------------------------------------------------------------
+[common.CanvasObject]
+  String getId()                 고유 ID. 생성 시 UUID.randomUUID().toString()
+                                 으로 정하고 절대 바꾸지 않는다 (final 필드).
+                                 네트워크 동기화에서 객체를 ID 로 찾기 때문.
+  void draw(Graphics2D g)        자기 자신을 그린다. 그리기 코드는 객체 안에만 둔다.
+  void move(int dx, int dy)      dx, dy 만큼 이동.
+  boolean contains(int x, int y) 좌표가 객체 영역 안이면 true (선택 판정용).
+
+[common.Tool]
+  mousePressed / mouseDragged / mouseReleased (MouseEvent)
+  - CanvasPanel 이 현재 도구에 그대로 넘긴다. 도구별 동작은 Tool 구현체가 결정.
+  - 사용하지 않는 메서드는 빈 메서드로 두고 주석을 단다.
+
+[common.Command]
+  void execute()  작업 실행. Redo 할 때도 이 메서드가 다시 호출된다.
+                  실패하면 반드시 예외를 던진다 (그래야 기록이 남지 않음).
+  void undo()     execute() 이전 상태로 되돌린다.
+  - Redo 시 객체 ID 가 유지되도록, Command 는 생성 시 받은 같은 객체
+    인스턴스를 계속 들고 있어야 한다 (execute 안에서 새 객체 생성 금지).
+
+[common.Feature]
+  String getName()   도구 버튼에 표시되는 이름. 등록 중복 판단 기준.
+  Tool createTool()  이 기능의 도구를 새로 만들어 반환 (Factory 역할).
+  - 관리자 객체(ObjectManager, HistoryManager 등)가 필요하면
+    Feature 생성자로 받아 두었다가 createTool() 에서 Tool 에 넘긴다.
+    (TestFeature 가 예시)
+
+[client.core.ObjectManager]
+  boolean addObject(obj)        같은 ID 가 이미 있으면 false. null 이면 예외.
+  boolean removeObject(id)      ID 로 제거. 없으면 false.
+  CanvasObject getObjectById(id) 없으면 null.
+  List<CanvasObject> getObjects() 읽기 전용 복사본 (변경 시도 시 예외).
+  - 내부는 ArrayList. 추가 순서 = 화면 출력 순서 (나중 것이 위에 그려짐).
+
+[client.core.ToolManager]
+  setCurrentTool(tool) / getCurrentTool()
+  - 도구 미선택 상태는 null. 호출하는 쪽(CanvasPanel)이 null 을 확인한다.
+  - 도구 변경은 객체 데이터에 영향을 주지 않는다.
+
+[client.core.HistoryManager]
+  executeCommand(cmd)  cmd.execute() 성공 후에만 undo 스택에 push, redo 스택 비움.
+  undo()               스택 비면 아무것도 안 함. undo() 성공 후 redo 스택으로 이동.
+  redo()               스택 비면 아무것도 안 함. execute() 성공 후 undo 스택으로 이동.
+  - 내부는 ArrayDeque 두 개 (undoStack, redoStack).
+
+[client.core.FeatureRegistry]
+  boolean register(feature)  같은 이름이 있으면 false.
+  List<Feature> getFeatures() 등록 순서대로, 읽기 전용 복사본.
+  - 새 기능을 추가해도 이 클래스는 수정하지 않는다.
+
+[client.core.AddObjectCommand]
+  execute(): objectManager.addObject(obj), 실패(중복 ID) 시 IllegalStateException
+  undo():    objectManager.removeObject(obj.getId())
+
+[client.ui.MainFrame]
+  - FeatureRegistry 의 기능마다 JToggleButton 을 자동 생성.
+    버튼 클릭 -> toolManager.setCurrentTool(feature.createTool())
+  - "실행 취소" / "다시 실행" 버튼 -> historyManager.undo()/redo() 후 canvasPanel.repaint()
+  - 기능을 추가해도 이 클래스는 수정하지 않는다.
+
+[client.ui.CanvasPanel]
+  - paintComponent: super.paintComponent(g) 호출 후, 객체마다 g.create() 로
+    복사한 Graphics2D 를 넘겨 draw() 호출 (객체 간 색/선 설정 간섭 방지).
+  - 마우스 이벤트 -> 현재 Tool 에 전달 -> repaint().
+  - 왼쪽 아래에 "객체 수: N" 표시 (테스트 확인용).
+  - 객체별 그리기 코드를 여기에 쓰지 않는다.
+
+[client.Main]
+  - SwingUtilities.invokeLater 안에서 관리자 생성 -> 기능 등록 -> 창 표시.
+  - 새 기능 등록은 여기에 register(...) 한 줄을 추가하는 것으로 끝난다.
+
+--------------------------------------------------------------------------
+5. 전체 동작 흐름
+--------------------------------------------------------------------------
+ Main
+  └ ObjectManager, ToolManager, HistoryManager, FeatureRegistry 생성
+  └ featureRegistry.register(new XxxFeature(...))
+  └ new MainFrame(...).setVisible(true)
+
+ [도구 선택]  도구 버튼 클릭 -> feature.createTool() -> toolManager.setCurrentTool()
+ [캔버스 입력] 마우스 -> CanvasPanel -> currentTool.mouseXxx(e)
+              -> Tool 이 Command 생성 -> historyManager.executeCommand(cmd)
+              -> cmd.execute() 가 ObjectManager 변경 -> repaint()
+ [화면 출력]  paintComponent -> objectManager.getObjects() -> 각 obj.draw(g2)
+ [Undo/Redo] 버튼 -> historyManager.undo()/redo() -> repaint()
+
+ 적용 패턴
+  - Strategy : Tool 인터페이스 + ToolManager (도구 교체만으로 클릭 동작이 바뀜)
+  - Command  : Command + AddObjectCommand + HistoryManager (작업을 객체로 기록)
+  - Factory  : Feature.createTool() (MainFrame 은 구체 Tool 클래스를 모름)
+  - 다형성   : CanvasObject (ObjectManager/CanvasPanel 은 객체 종류를 모름)
+
+--------------------------------------------------------------------------
+6. 반드시 지켜야 할 규칙
+--------------------------------------------------------------------------
+ 1) 기능은 자기 패키지(client.feature.xxx) 안에서만 구현한다.
+ 2) 모든 캔버스 객체는 CanvasObject 를 구현한다.
+ 3) 객체 추가/삭제/이동/수정처럼 상태를 바꾸는 사용자 작업은 Command 로 만들어
+    historyManager.executeCommand() 로 실행한다.
+    ObjectManager 를 Tool 에서 직접 변경하지 않는다 (Undo 기록이 사라짐).
+    단, 드래그 중 미리보기처럼 임시 상태는 Tool 내부에 두고,
+    마우스를 놓을 때(mouseReleased) 최종 결과를 Command 하나로 실행한다.
+ 4) 그리기 코드는 각 CanvasObject.draw() 안에만 둔다.
+ 5) core / ui / common 은 꼭 필요할 때만 수정한다. 수정했다면 이유를 보고하고
+    이 문서도 고친다. (두 사람이 동시에 고치면 충돌이 나기 쉬운 파일들임)
+ 6) 객체 ID 는 생성 시 한 번 정하고 바꾸지 않는다.
+ 7) Swing 화면/ObjectManager 는 EDT(Swing 이벤트 스레드)에서만 다룬다.
+    다른 스레드(향후 네트워크 수신 스레드 등)에서 바꿀 때는
+    SwingUtilities.invokeLater(...) 로 넘긴다.
+ 8) 아직 구현하지 않는 기능의 빈 클래스를 미리 만들지 않는다.
+ 9) 불필요한 추상 클래스, 과한 디자인 패턴을 추가하지 않는다.
+    대학 수업 수준에서 두 사람이 읽고 유지보수할 수 있는 구조를 유지한다.
+10) Command 클래스는 꼭 필요한 것만 만든다. 여러 기능이 같이 쓰는 명령
+    (추가/삭제/이동)은 client.core 에, 특정 기능 전용 명령(예: 표 셀 수정)은
+    해당 기능 패키지에 둔다.
+11) 외부 라이브러리 추가, 로그인/영구 저장 기능은 사용자 확인 없이 하지 않는다.
+
+--------------------------------------------------------------------------
+7. 새 기능 추가 방법 (표 기능 예시)
+--------------------------------------------------------------------------
+ 생성할 파일 (패키지 client.feature.table):
+  - TableObject.java   implements CanvasObject
+  - TableTool.java     implements Tool
+  - TableFeature.java  implements Feature
+  - (필요 시) 표 전용 Command. 예: EditCellCommand.java implements Command
+
+ 수정할 파일:
+  - client/Main.java 에 등록 한 줄만 추가
+      featureRegistry.register(new TableFeature(objectManager, historyManager));
+
+ 코드 골격:
+  public class TableObject implements CanvasObject {
+      private final String id = UUID.randomUUID().toString();
+      private int x, y;            // 위치
+      // 행/열 수, 셀 내용 등 표 고유 데이터
+      public String getId() { return id; }
+      public void draw(Graphics2D g) { /* 표 그리기 */ }
+      public void move(int dx, int dy) { x += dx; y += dy; }
+      public boolean contains(int px, int py) { /* 영역 판정 */ }
+  }
+
+  public class TableTool implements Tool {
+      // 생성자로 ObjectManager, HistoryManager 를 받는다
+      public void mousePressed(MouseEvent e) {
+          TableObject t = new TableObject(e.getX(), e.getY(), ...);
+          historyManager.executeCommand(new AddObjectCommand(objectManager, t));
+      }
+      public void mouseDragged(MouseEvent e) { }
+      public void mouseReleased(MouseEvent e) { }
+  }
+
+  public class TableFeature implements Feature {
+      // 생성자로 관리자를 받아 보관
+      public String getName() { return "표"; }
+      public Tool createTool() { return new TableTool(objectManager, historyManager); }
+  }
+
+ 캘린더는 client.feature.calendar 에 CalendarObject / CalendarTool /
+ CalendarFeature 를 같은 방식으로 만든다.
+ 두 팀원이 서로 다른 feature 패키지에서 작업하면 겹치는 파일은 Main.java 의
+ register 줄 하나뿐이다.
+
+ 계획된 기능 패키지:
+  client.feature.drawing   펜 그리기 (색상, 굵기)
+  client.feature.text      텍스트 삽입/수정
+  client.feature.image     이미지 불러오기/배치/크기 조절
+  client.feature.table     표 (행/열, 셀 편집)
+  client.feature.calendar  캘린더 (일정 작성/수정)
+  client.feature.eraser    통합 지우개 + 자동 이미지 변환
+
+--------------------------------------------------------------------------
+8. 앞으로의 구현 방향 (아직 구현 안 됨 - 권장 방향)
+--------------------------------------------------------------------------
+ 아래 내용은 설계 방향 제안이다. 구현 시점에 팀이 최종 결정한다.
+ 구조를 크게 바꾸게 되면 사용자에게 먼저 설명하라.
+
+ [주차별 계획 - 제안서 기준]
+  10주차 기획/설계          (완료: 기본 아키텍처 구축)
+  11주차 TCP 통신 구조      서버/클라이언트 연결, 다중 접속, 메시지 송수신
+  12주차 캔버스/그림        무한 캔버스 이동, 펜, 기본 지우개, 그림 실시간 공유
+  13주차 콘텐츠 객체        텍스트, 이미지, 독립 객체 이동/수정 동기화
+  14주차 표/캘린더          셀 편집, 일정 입력, 변경 이벤트 공유
+  15주차 고급 편집          통합 지우개, 자동 이미지 변환, 보관함(Could) 검토
+  16주차 통합 테스트/발표
+
+ [네트워크 (11주차~)]
+  - 구조: 클라이언트-서버. 서버는 받은 변경 메시지에 순서를 매겨
+    모든 클라이언트에 전달한다. java.net.Socket / ServerSocket 직접 사용.
+  - 권장 패키지: server (서버 프로그램, 별도 main), client.network
+    (클라이언트 연결/송수신), common 에 메시지 형식 정의.
+  - 메시지는 "어떤 객체(ID)에 무엇을 했는가" 단위로 설계한다.
+    예: CREATE(객체 종류, ID, 데이터), MOVE(ID, dx, dy), UPDATE(ID, 데이터),
+        DELETE(ID), STROKE(펜 좌표 묶음)
+    객체 ID 가 모든 클라이언트에서 같아야 하므로 ID 는 생성한 쪽의 UUID 를
+    그대로 전송한다.
+  - 수신 스레드는 받은 메시지를 SwingUtilities.invokeLater 로 EDT 에 넘겨
+    ObjectManager 를 바꾸고 repaint 한다.
+  - 원격 객체를 받으려면 "메시지 -> 객체" 로 다시 만드는 방법이 필요하다.
+    이때 객체 종류별 생성 코드도 각 feature 패키지에 두어
+    기능 간 독립성을 유지한다.
+  - 결정 필요: Undo/Redo 를 내 작업에만 적용할지, 다른 사용자 작업과
+    충돌할 때 어떻게 처리할지. 권장: 자기 작업만 Undo 하고,
+    Undo 도 일반 변경 메시지(DELETE 등)로 전송한다.
+
+ [무한 캔버스 (12주차)]
+  - CanvasPanel 에 화면 이동량(offsetX, offsetY)을 두고, 그릴 때
+    g2.translate(offsetX, offsetY) 를 적용한다. 객체 좌표는 "캔버스 좌표"로 저장.
+  - 주의: 지금 Tool 은 MouseEvent 의 화면 좌표(e.getX())를 그대로 쓴다.
+    화면 이동이 생기면 화면 좌표 -> 캔버스 좌표 변환이 필요하므로,
+    CanvasPanel 이 변환된 좌표를 넘기도록 Tool 인터페이스 또는 전달 방식을
+    한 번 수정해야 할 수 있다. 이 변경은 모든 Tool 에 영향을 주므로
+    두 팀원이 합의 후 한 사람이 진행한다.
+  - 화면 이동(드래그로 패닝)은 별도 도구 또는 마우스 가운데/오른쪽 버튼으로 처리.
+
+ [펜 그리기 (12주차)]
+  - 한 번의 누름~놓기가 하나의 StrokeObject (점 목록, 색, 굵기).
+  - 드래그 중 점은 Tool 내부에 임시 저장해 미리보기만 하고,
+    mouseReleased 에서 AddObjectCommand 로 확정한다.
+  - 네트워크: 드래그 중 좌표를 버퍼에 모아 일정 간격으로 전송 (제안서 방식).
+
+ [객체 이동 (13주차)]
+  - 선택/이동 도구를 하나 만들고, 놓는 시점에 MoveObjectCommand(ID, dx, dy)
+    로 확정한다 (undo 는 반대 방향 이동). 이 Command 는 공통이므로 client.core 에 둔다.
+  - 객체 선택은 위에 그려진 것(목록 뒤쪽)부터 contains() 로 검사한다.
+
+ [통합 지우개 / 자동 이미지 변환 (15주차)]
+  - 펜 그림: 지우개 영역에 닿는 부분을 제거.
+  - 표/캘린더: 지우개가 닿으면 그 객체를 같은 위치의 ImageObject 로 교체하고
+    (원본 draw() 결과를 BufferedImage 로 렌더링), 원본 객체는 ImageObject 가
+    보관해 복구에 쓴다. 교체는 "삭제+추가" 를 하나의 Command 로 묶어 Undo 가능하게 한다.
+  - 객체 위에 펜으로 그린 경우에는 변환하지 않는다 (펜 그림은 별도 객체).
+
+--------------------------------------------------------------------------
+9. 진행 현황 (작업 후 갱신할 것)
+--------------------------------------------------------------------------
+ 항목                       상태        비고
+ 기본 아키텍처              완료        10주차. 테스트 기능으로 검증
+ Undo/Redo (객체 추가)      완료        AddObjectCommand
+ TCP 서버/클라이언트        미구현
+ 실시간 동기화              미구현
+ 무한 캔버스                미구현
+ 펜 그리기                  미구현
+ 텍스트                     미구현
+ 객체 선택/이동             미구현      CanvasObject.move() 만 있음
+ 이미지                     미구현
+ 표                         미구현
+ 캘린더                     미구현
+ 통합 지우개/이미지 변환    미구현
+ 중요 영역 보관함           미구현      Could
+ 로그인/영구 저장           제외        Won't
+
+--------------------------------------------------------------------------
+10. 테스트 기능(client.feature.test)에 대하여
+--------------------------------------------------------------------------
+ - 아키텍처 확인용이다. 실제 기능이 하나 이상 생기기 전까지는 지우지 않는다.
+ - 확인 방법: 실행 > "테스트 사각형" 버튼 > 캔버스 클릭 (사각형 생성,
+   왼쪽 아래 객체 수 증가) > 실행 취소 (사라짐) > 다시 실행
+   (같은 ID 앞 8자리로 다시 나타남).
+ - 나중에 제거할 때는 Main.java 의 register 줄과 feature/test 패키지를 삭제한다.
